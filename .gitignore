@@ -5,3 +5,7 @@ build/
 .env
 .env.*
 !.env.example
+*.pem
+*.key
+.vscode/
+HELP.md
