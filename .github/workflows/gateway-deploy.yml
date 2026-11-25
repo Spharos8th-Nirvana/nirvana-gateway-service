@@ -1,0 +1,84 @@
+name: Build and Deploy (gateway)
+
+# PR(develop, main): 이미지 빌드만 검사 (올리지도 배포하지도 않음)
+# main push: 이미지 빌드 -> GHCR 푸시 -> AWS 서버 배포
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "develop", "main" ]
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    # push(배포)는 모두 한 줄로 세우고, PR 검사는 PR마다 따로 돌게 함
+    # -> PR 검사가 대기 중인 배포를 취소하지 못함
+    concurrency:
+      group: ${{ github.event_name == 'push' && 'deploy-gateway' || format('ci-gateway-{0}', github.ref) }}
+      cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # 이미지 이름은 소문자만 가능해서 변환 (조직 이름에 대문자가 있음)
+      - name: Set image name
+        run: echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}:${{ github.run_number }}" >> "$GITHUB_ENV"
+
+      - name: Log in to GHCR
+        if: github.event_name == 'push'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: ${{ github.event_name == 'push' }}
+          tags: ${{ env.IMAGE }}
+          labels: org.opencontainers.image.source=https://github.com/${{ github.repository }}
+
+      - name: Deploy to AWS server
+        if: github.event_name == 'push'
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.HOST_EC2 }}
+          username: ubuntu
+          key: ${{ secrets.EC2_KEY }}
+          script: |
+            set -e
+            docker pull "${{ env.IMAGE }}"
+            docker stop gateway || true
+            docker rm gateway || true
+            # 서버 8080 -> 컨테이너 8000 (ALB 대상 그룹 tg-gateway가 8080)
+            docker run -d \
+              --name gateway \
+              --restart unless-stopped \
+              --network nirvana \
+              -e JAVA_TOOL_OPTIONS="-Xmx384m" \
+              -p 8080:8000 \
+              "${{ env.IMAGE }}"
+
+            # 이 레포에서 만든 오래된 이미지만 정리 (24시간 이상, 안 쓰는 것)
+            docker image prune -a -f \
+              --filter "until=24h" \
+              --filter "label=org.opencontainers.image.source=https://github.com/${{ github.repository }}"
+
+            # 배포 확인: 최대 90초 동안 5초마다 Gateway가 응답하는지 본다
+            # (루트 경로는 404일 수 있어서 상태 코드가 000(연결 실패)만 아니면 기동으로 본다)
+            for i in $(seq 1 18); do
+              code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/ || true)
+              if [ "$code" != "000" ]; then
+                echo "gateway is up (http $code)"
+                exit 0
+              fi
+              sleep 5
+            done
+            echo "gateway did not respond. last logs:"
+            docker logs --tail 50 gateway
+            exit 1
