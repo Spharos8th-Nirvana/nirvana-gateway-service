@@ -1,0 +1,70 @@
+name: Deploy to Dev (gateway)
+
+# 개발 서버(노트북) 배포: develop 에 push(= PR merge)될 때만 실행한다.
+# 보안: pull_request 이벤트는 절대 넣지 않는다. (공개 레포 + self-hosted runner)
+on:
+  push:
+    branches: [ "develop" ]
+
+permissions:
+  contents: read
+
+jobs:
+  deploy-dev:
+    runs-on: dev-laptop
+    concurrency:
+      group: deploy-gateway-dev
+      cancel-in-progress: false
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build image
+        run: |
+          $ErrorActionPreference = 'Continue'
+          docker build `
+            --label "org.opencontainers.image.source=https://github.com/${{ github.repository }}" `
+            -t "gateway-dev:${{ github.run_number }}" .
+          if ($LASTEXITCODE -ne 0) { Write-Host "build failed"; exit 1 }
+
+      - name: Deploy (replace container)
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $old = docker ps -aq --filter "name=^gateway$"
+          if ($old) {
+            docker stop gateway | Out-Null
+            docker rm gateway | Out-Null
+          }
+          # 노트북 8080 -> 컨테이너 8000. 127.0.0.1 로만 열어 외부(같은 와이파이 등)에서는 접근 불가
+          docker run -d `
+            --name gateway `
+            --restart unless-stopped `
+            --network nirvana `
+            -e JAVA_TOOL_OPTIONS="-Xmx384m" `
+            -p 127.0.0.1:8080:8000 `
+            "gateway-dev:${{ github.run_number }}"
+          if ($LASTEXITCODE -ne 0) { Write-Host "docker run failed"; exit 1 }
+
+          # 이 레포에서 만든 오래된 이미지만 정리 (24시간 이상, 안 쓰는 것)
+          docker image prune -a -f --filter "until=24h" --filter "label=org.opencontainers.image.source=https://github.com/${{ github.repository }}" | Out-Null
+
+          # 배포 확인: 최대 90초 동안 5초마다 Gateway가 응답하는지 본다
+          # (루트 경로는 404일 수 있어서, 연결 실패가 아니라 HTTP 응답이 오면 기동으로 본다)
+          for ($i = 1; $i -le 18; $i++) {
+            $code = 0
+            try {
+              $code = [int](Invoke-WebRequest -UseBasicParsing -Uri http://127.0.0.1:8080/ ).StatusCode
+            } catch {
+              if ($_.Exception.Response) { $code = [int]$_.Exception.Response.StatusCode }
+            }
+            if ($code -gt 0) {
+              Write-Host "gateway is up (http $code)"
+              exit 0
+            }
+            Start-Sleep -Seconds 5
+          }
+          Write-Host "gateway did not respond. last logs:"
+          docker logs --tail 50 gateway
+          exit 1
